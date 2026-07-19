@@ -30,6 +30,21 @@ from interactive_world_sim.utils.logging_utils import (
 from interactive_world_sim.utils.normalizer import LinearNormalizer
 
 
+def compute_diff_labels(frame_prev, frame_next, target_hw, threshold=0.04):
+    """3-class luminance change map (0=darker, 1=static, 2=brighter), pooled to
+    the latent resolution with signed max-pooling so sparse thin-line motion
+    survives the 128 -> 32 downsample. Returns one-hot (B, 3, target_hw, target_hw).
+    frame_*: (B, 3, H, W) in [0, 1]."""
+    w = torch.tensor([0.299, 0.587, 0.114], device=frame_prev.device).view(1, 3, 1, 1)
+    diff = ((frame_next * w).sum(1) - (frame_prev * w).sum(1)).unsqueeze(1)  # (B,1,H,W)
+    mag = F.adaptive_max_pool2d(diff.abs(), target_hw)
+    sign = torch.sign(F.adaptive_avg_pool2d(diff, target_hw))
+    pooled = (mag * sign).squeeze(1)                                          # (B,h,w)
+    labels = torch.ones_like(pooled, dtype=torch.long)
+    labels[pooled < -threshold] = 0
+    labels[pooled > threshold] = 2
+    return F.one_hot(labels, 3).permute(0, 3, 1, 2).float()
+
 class LatentWorldModel(BasePytorchAlgo):
     """StudentV1_0"""
 
@@ -93,6 +108,14 @@ class LatentWorldModel(BasePytorchAlgo):
             module=hydra.utils.instantiate(self.cfg.dynamics),
         )
 
+        # Physical bottleneck: change map D as an input condition to the dynamics.
+        # Zero-init so that at initialization the model is EXACTLY the baseline.
+        self.use_diff_cond = self.cfg.use_diff_cond if "use_diff_cond" in self.cfg else False
+        if self.use_diff_cond:
+            self.diff_proj = nn.Conv2d(3, self.num_latent_channel, 3, padding=1)
+            nn.init.zeros_(self.diff_proj.weight)
+            nn.init.zeros_(self.diff_proj.bias)
+
         # encoder
         latent_ch = self.num_latent_channel
         encoder_module_ls = [nn.Conv2d(self.cfg.x_shape[0], latent_ch, 3, padding=1)]
@@ -150,6 +173,10 @@ class LatentWorldModel(BasePytorchAlgo):
             param_groups = [
                 {"params": self.dynamics.parameters(), "lr": self.cfg.lr},
             ]
+            if self.use_diff_cond:
+                # Without this the zero-init projection never receives gradients
+                # and stays zero forever, silently degenerating to the baseline.
+                param_groups.append({"params": self.diff_proj.parameters(), "lr": self.cfg.lr})
         elif self.training_stage == 3:
             param_groups = [
                 {"params": self.decoder.parameters(), "lr": self.cfg.lr * 0.1},
@@ -261,10 +288,19 @@ class LatentWorldModel(BasePytorchAlgo):
 
     # ========= inference  ============
     @torch.no_grad()
-    def dynamics_forward(self, z_0: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        """dynamics forward pass"""
+    def dynamics_forward(
+        self,
+        z_0: torch.Tensor,
+        action: torch.Tensor,
+        diff_cond: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """dynamics forward pass.
+
+        diff_cond: (B, N_gen, 3, h, w) one-hot change maps, entry k conditions
+        the k-th generated frame. None = baseline behavior (no injection).
+        """
         z_0 = rearrange(z_0, "b t c h w -> t b c h w")  # (T_hist, B, C, H, W)
-        action = rearrange(action, "b t c -> t b c")  # (T_hist + T_act, B, A)
+        action = rearrange(action, "b t c -> t b c")
         T_hist = z_0.shape[0]
         T_act = action.shape[0] - T_hist
         chunk_size = 1
@@ -273,7 +309,6 @@ class LatentWorldModel(BasePytorchAlgo):
         xs_pred = z_0.clone()
         batch_size = z_0.shape[1]
 
-        # pbar = tqdm(total=total_frames, initial=curr_end, desc="Sampling")
         while curr_end <= total_frames:
             horizon = chunk_size
 
@@ -285,15 +320,7 @@ class LatentWorldModel(BasePytorchAlgo):
             chunk = torch.clamp(chunk, -self.clip_noise, self.clip_noise)
             xs_pred = torch.cat([xs_pred, chunk], 0)
 
-            # sliding window: only input the last n_tokens frames
             curr_start = max(0, curr_end - self.n_tokens)
-
-            # pbar.set_postfix(
-            #     {
-            #         "start": curr_start,
-            #         "end": curr_end,
-            #     }
-            # )
 
             clean_t = (
                 torch.ones((xs_pred[curr_start:].shape[0] - 1,), device=self.device)
@@ -309,6 +336,14 @@ class LatentWorldModel(BasePytorchAlgo):
             if self.mask_prev_action:
                 action_chunk[:-1] = 0
 
+            # Physical bottleneck: compute the injection feature ONCE per
+            # generated frame, outside the denoising loop, so multi-step
+            # denoising (dyn_infer_steps > 1) does not re-add it every step.
+            d_feat = None
+            if diff_cond is not None and getattr(self, "use_diff_cond", False):
+                k = curr_end - T_hist - 1  # 0-based index of the frame being generated
+                d_feat = self.diff_proj(diff_cond[:, k].to(xs_pred.dtype))
+
             for step_i in range(self.dyn_infer_steps):
                 t = timesteps[step_i].unsqueeze(0)
                 s = timesteps[step_i + 1].unsqueeze(0)
@@ -318,20 +353,27 @@ class LatentWorldModel(BasePytorchAlgo):
                 s = torch.tile(s[:, None], (1, xs_pred.shape[1]))
                 t = t.long()
                 s = s.long()
+
+                model_in = xs_pred[curr_start:]
+                if d_feat is not None:
+                    model_in = model_in.clone()
+                    model_in[-1] = model_in[-1] + d_feat
+
                 xs_pred_updated = self._forward(
                     self.dynamics,
-                    xs_pred[curr_start:],
+                    model_in,
                     t,
                     s,
                     external_cond=action_chunk,
-                )  # clamp at inference time
+                )
+                # CRITICAL: write the denoised result back (this block exists
+                # in the original code and must not be dropped).
                 if self.last_frame_loss_only:
                     xs_pred[-1:] = xs_pred_updated[-1:]
                 else:
                     xs_pred[curr_start:] = xs_pred_updated
 
             curr_end += horizon
-            # pbar.update(horizon)
 
         # normalization
         num_views = len(self.obs_keys)
@@ -597,6 +639,17 @@ class LatentWorldModel(BasePytorchAlgo):
             weights_t = self.noise_scheduler.get_weights(t)
             weights_s = self.noise_scheduler.get_weights(s)
             noisy_z_t, noisy_z_s = self.noise_scheduler.add_noise_to_t_s(z, t, s)
+
+            if self.use_diff_cond:
+                raw = batch["obs"][self.obs_keys[0]].float()   # (B, T, 3, H, W)
+                if raw.max() > 1.5:                             # guard against 0-255 data
+                    raw = raw / 255.0
+                # D for the terminal frame: change from frame T-2 to frame T-1
+                d_onehot = compute_diff_labels(
+                    raw[:, -2], raw[:, -1], self.latent_resolution
+                ).to(noisy_z_t.dtype)
+                noisy_z_t = noisy_z_t.clone()
+                noisy_z_t[-1] = noisy_z_t[-1] + self.diff_proj(d_onehot)
 
             u = torch.zeros_like(t).to(self.device)
             if self.mask_prev_action:
