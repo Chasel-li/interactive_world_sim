@@ -641,15 +641,18 @@ class LatentWorldModel(BasePytorchAlgo):
             noisy_z_t, noisy_z_s = self.noise_scheduler.add_noise_to_t_s(z, t, s)
 
             if self.use_diff_cond:
-                raw = batch["obs"][self.obs_keys[0]].float()   # (B, T, 3, H, W)
-                if raw.max() > 1.5:                             # guard against 0-255 data
+                raw = batch["obs"][self.obs_keys[0]].float()
+                if raw.max() > 1.5:
                     raw = raw / 255.0
-                # D for the terminal frame: change from frame T-2 to frame T-1
                 d_onehot = compute_diff_labels(
                     raw[:, -2], raw[:, -1], self.latent_resolution
                 ).to(noisy_z_t.dtype)
+                d_feat = self.diff_proj(d_onehot)
                 noisy_z_t = noisy_z_t.clone()
-                noisy_z_t[-1] = noisy_z_t[-1] + self.diff_proj(d_onehot)
+                noisy_z_t[-1] = noisy_z_t[-1] + d_feat
+                if batch_idx % 100 == 0:
+                    self.log("training/diff_proj_wnorm", self.diff_proj.weight.norm())
+                    self.log("training/diff_feat_norm", d_feat.norm())
 
             u = torch.zeros_like(t).to(self.device)
             if self.mask_prev_action:
